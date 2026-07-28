@@ -355,6 +355,26 @@ Run: ~/vonr_call.sh
 >  If you see `IP: 192.168.100.x` instead — the UE got the internet APN, not
 >  IMS. See [Troubleshooting](#troubleshooting).
 
+**Before moving on to Step 3.5, check that every container actually stayed
+up.** The MySQL-not-ready-yet race described in
+[Bug 14](#bug-14--pyhss-crash-loops-on-first-boot-access-denied-for-user-pyhss)
+is **not unique to `pyhss`** — any container that opens a MySQL connection
+during its own startup can lose the same race and crash on a fresh boot.
+`scscf` (S-CSCF) has been observed doing exactly this (see
+[Bug 15](#bug-15--any-mysql-dependent-container-can-lose-the-startup-race-not-just-pyhss)),
+and when it does, the symptom is confusing: `vonr_call.sh` fails with a
+generic `Call 1 ... error`, `icscf`'s own logs fill with `ERROR: tm
+[t_fwd.c:851]: add_uac(): maximum number of branches exceeded` (it's
+retrying to forward to a dead S-CSCF), and none of that visibly says
+"S-CSCF is down." Check every container's actual status before assuming
+subscriber provisioning is the problem:
+```bash
+docker ps -a --format "table {{.Names}}\t{{.Status}}" | grep -v "Up "
+```
+This should print **only the header row** (nothing after it). If any
+container shows `Exited`, `docker start <name>`, wait ~10-15s, and check
+again before continuing.
+
 ---
 
 ## Step 3.5 — Provision Subscribers (REQUIRED, not automated by any script)
@@ -862,6 +882,53 @@ problems to debug individually.
 
 ---
 
+### Bug 15 — Any MySQL-Dependent Container Can Lose the Startup Race, Not Just pyHSS
+
+**Symptom:** `~/vonr_call.sh` fails with a plain `Call 1 ... error` even
+though subscribers are correctly provisioned (Step 3.5 verified both PASS
+lines) and the UE has a valid PDU session. `docker ps -a` shows one of the
+Kamailio containers — observed on `scscf` (S-CSCF) — as `Exited (255)`.
+Its logs show:
+```
+ERROR: db_mysql [km_my_con.c:224]: db_mysql_new_connection(): driver error: Can't connect to MySQL server on '172.22.0.17:3306' (111)
+ERROR: <core> [lib/srdb1/db.c:325]: db_do_init2(): could not add connection to the pool
+ERROR: presence [presence.c:437]: mod_init(): Connection to database failed
+ERROR: error while initializing modules
+```
+Meanwhile `icscf` (which is still up) fills with a *different-looking* and
+easy to misdiagnose error, because it's a side effect, not the root cause:
+```
+ERROR: tm [t_fwd.c:851]: add_uac(): maximum number of branches exceeded
+ERROR: tm [t_fwd.c:1830]: t_forward_nonack(): failure to add branches
+```
+
+**Root cause:** This is the exact same race as
+[Bug 14](#bug-14--pyhss-crash-loops-on-first-boot-access-denied-for-user-pyhss)
+— MySQL isn't done accepting connections yet when the container tries to
+connect during its own startup — but it is **not specific to pyHSS**. Any
+container in this stack that opens a MySQL connection on boot can lose the
+same race on a slow first start. When S-CSCF loses it, I-CSCF keeps
+retrying to forward REGISTER to a dead S-CSCF, building up branches until
+Kamailio's own branch limit is hit and the transaction fails outright —
+which is what actually produces the `Call 1 ... error` you see, several
+layers removed from the real cause.
+
+**Fix:** Same as Bug 14 — it's a one-time startup race, not a real
+credentials or config problem. Restart the affected container and confirm
+it's actually `running`, not just that the command returned:
+```bash
+docker start scscf
+sleep 10
+docker ps --format "table {{.Names}}\t{{.Status}}" | grep scscf   # must say Up
+docker logs --since 5s scscf 2>&1   # should show Diameter connecting to pyHSS cleanly, no new errors
+```
+**Don't assume only `pyhss` needs this check.** Run the all-containers scan
+under [Step 3](#step-3--start-the-stack) (`docker ps -a | grep -v "Up "`)
+any time something fails for no obvious reason — it catches this class of
+problem regardless of which container lost the race.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -885,6 +952,7 @@ problems to debug individually.
 | `verify_vonr_complete.sh`: I-CSCF/S-CSCF no route | Only P-CSCF has `NET_ADMIN` by default | Harmless for calls; add `NET_ADMIN` to fix the check — see [Bug 12](#bug-12--i-cscfs-cscf-route-add-fails-silently-no-net_admin) |
 | WebUI login returns `403 CSRF token missing` | `curl`/API login without a CSRF token | Provision subscribers via `open5gs-dbctl` instead (see [Subscriber Configuration](#subscriber-configuration)), or use a real browser for the WebUI |
 | `pyhss` exits shortly after start, `Access denied for user 'pyhss'` | MySQL user-creation race on first boot | `docker start pyhss` — see [Bug 14](#bug-14--pyhss-crash-loops-on-first-boot-access-denied-for-user-pyhss) |
+| `vonr_call.sh` fails with plain `Call 1 ... error`, subscribers ARE provisioned correctly | Another container (e.g. `scscf`) lost the same MySQL startup race as Bug 14 | `docker ps -a \| grep -v "Up "` to find it, then `docker start <name>` — see [Bug 15](#bug-15--any-mysql-dependent-container-can-lose-the-startup-race-not-just-pyhss) |
 | `E: Unable to locate package docker-compose-plugin` | Docker CE already installed from a different apt repo | Check `docker --version && docker compose version` first — skip the whole Docker install block if both work |
 | Pasted a multi-line command, terminal now shows `>` forever | Heredoc terminator got indented by your paste tool, bash is still waiting for it | `Ctrl-D` to escape, then use the single-line `printf`/`-e` form given nearby instead of the heredoc |
 | `verify_vonr_complete.sh`: `[FAIL] S-CSCF — no active SIP registrations`, but Section 9's live call passed anyway | Section 8 checks registration state *before* Section 9 places its own test call — a check-ordering bug in the script itself, most visible right after recreating `icscf`/`scscf` | Not a real failure (Section 9 already proved it works). Run the script a second time back-to-back and it will find the registration left by the first run's Section 9 |
