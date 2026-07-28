@@ -24,7 +24,7 @@
 > ⚠️ **This is not actually 5 commands.** `start_vonr.sh` does **not**
 > provision any subscribers — if you run only the commands below, `vonr_call.sh`
 > will fail instantly with `Call 1 ... error` on UE1 and nothing on UE2. You
-> must do [Step 2.5](#step-25--provision-subscribers-required-not-automated-by-any-script)
+> must do [Step 3.5](#step-35--provision-subscribers-required-not-automated-by-any-script)
 > (both halves — 5G core **and** IMS/pyHSS, they are separate) before the
 > first `vonr_call.sh`. This block only exists to show the *shape* of a
 > normal session once you're already set up — follow the numbered Steps
@@ -32,7 +32,7 @@
 
 ```bash
 ./start_vonr.sh          # start everything (~3 min) — does NOT provision subscribers
-#  <-- Step 2.5 (both halves) must happen here, once, before your first call
+#  <-- Step 3.5 (both halves) must happen here, once, before your first call
 ./vonr_call.sh           # make a VoNR call
 ./vonr_full_kpi_logs.sh  # measure call quality KPIs
 ./verify_vonr_complete.sh # verify checks pass
@@ -56,8 +56,8 @@
 - [Prerequisites](#prerequisites)
 - [Step 1 — Install Dependencies](#step-1--install-dependencies)
 - [Step 2 — Clone and Configure](#step-2--clone-and-configure)
-- [Step 2.5 — Provision Subscribers](#step-25--provision-subscribers-required-not-automated-by-any-script)
 - [Step 3 — Start the Stack](#step-3--start-the-stack)
+- [Step 3.5 — Provision Subscribers](#step-35--provision-subscribers-required-not-automated-by-any-script)
 - [Step 4 — Make a VoNR Call](#step-4--make-a-vonr-call)
 - [Step 5 — Full KPI Measurement](#step-5--full-kpi-measurement)
 - [Step 6 — Verify Everything](#step-6--verify-everything)
@@ -305,9 +305,67 @@ first `docker compose up -d` (takes a few extra minutes, no action needed).
 
 ---
 
-## Step 2.5 — Provision Subscribers (REQUIRED, not automated by any script)
+## Step 3 — Start the Stack
 
-Neither `start_vonr.sh` nor the WebUI login work out of the box for this.
+```bash
+~/start_vonr.sh
+```
+
+The script does this automatically:
+
+| Step | Action |
+|------|--------|
+| 1 | Stop conflicting systemd services + disable ufw |
+| 2 | Remove any leftover containers |
+| 3 | Start 22 core containers via `sa-vonr-deploy.yaml` (no `ibcf`, see Step 2) |
+| 4 | Wait 30s for initialization |
+| 5 | Fix pyHSS `operation_log` schema (ALTER TABLE) |
+| 6 | Start srsRAN gNB → wait 15s |
+| 7 | Start srsRAN UE → wait 20s |
+| 8 | Add routing rules on P/I/S-CSCF to reach UE subnet |
+| 9 | Add NAT/MASQUERADE on UPF for IMS traffic |
+| 10 | Install linphonec + tcpdump inside UE container |
+| 11 | Add IMS DNS entries to UE `/etc/hosts` |
+| 12 | Create linphonec configs for UE1 (port 5070) and UE2 (port 5071) |
+
+> Step 8 needs `cap_add: NET_ADMIN` on `icscf` and `scscf` in the compose file
+> to actually succeed (only `pcscf` has it by default) — see
+> [Bug 12](#bug-12--icscfscscf-route-add-fails-silently-no-net_admin). Without
+> subscribers provisioned (Step 3.5) and that capability added, this step will
+> still report "ready" but the UE/calls will not actually work — the script
+> doesn't verify its own success.
+
+**Expected output at end (on your SECOND time through this whole README, once
+subscribers already exist):**
+```
+=== VoNR stack ready ===
+PDU Session Establishment successful. IP: 192.168.101.2
+Run: ~/vonr_call.sh
+```
+
+> ⚠️ **On a genuinely fresh setup (first time ever), you will NOT see the
+> "PDU Session Establishment successful" line here, and that is expected,
+> not a failure.** No subscriber exists in the database yet — that's Step
+> 3.5, right below, which can only run *after* this step because it needs
+> the containers `start_vonr.sh` just created. The UE tries to attach during
+> this script's own run, gets rejected (no subscriber = no attach), and the
+> script's `grep` for "PDU Session" simply finds nothing to print. Don't
+> debug this — it resolves itself once you do Step 3.5.
+>
+>  If you see `IP: 192.168.100.x` instead — the UE got the internet APN, not
+>  IMS. See [Troubleshooting](#troubleshooting).
+
+---
+
+## Step 3.5 — Provision Subscribers (REQUIRED, not automated by any script)
+
+> **This step must come after Step 3, not before** — its commands
+> (`docker exec webui ...`, `docker exec mysql ...`) target containers that
+> only exist once `start_vonr.sh` has created them. If you see `Error
+> response from daemon: No such container: webui` (or `mongo`, or `mysql`),
+> that's this: go back and run Step 3 first.
+
+Neither `start_vonr.sh` nor the WebUI login provision subscribers for you.
 **This step has two independent halves — you need both, or the call fails.**
 It's easy to do only Part A and stop, because it "succeeds" with no error —
 you just get an instant `Call 1 ... error` later with no obvious link back
@@ -372,62 +430,29 @@ docker exec mysql mysql -u root -pchangeme ims_hss_db -e "SELECT COUNT(*) FROM s
 If either shows 0 rows, that half didn't run — go back and redo it before
 touching `~/vonr_call.sh`.
 
+**☐ Part C — recreate the UE so it re-attaches now that a subscriber exists.**
+The UE already tried and failed to attach once, during Step 3 (before any
+subscriber existed) — it will not automatically retry on its own. Recreate
+gNB + UE together (per
+[Bug 13](#bug-13--ue-hangs-forever-at-attaching-ue-after-a-lone-restart),
+gNB and UE must always be recreated as a pair, never just one):
+```bash
+cd ~/docker_open5gs
+docker compose -f srsue_5g_zmq.yaml down
+docker compose -f srsgnb_zmq.yaml down
+docker compose -f srsgnb_zmq.yaml up -d
+sleep 15
+docker compose -f srsue_5g_zmq.yaml up -d
+sleep 20
+docker logs srsue_5g_zmq 2>&1 | grep "PDU Session"   # expect: PDU Session Establishment successful. IP: 192.168.101.2
+```
+If that line doesn't appear, see the note under Step 3 above, and
+[Troubleshooting](#troubleshooting).
+
 Full field-by-field explanation of every value used above is in
 [Subscriber Configuration](#subscriber-configuration) below, including why
 `ifc_path` and the `sst` field matter (they're both undocumented-elsewhere
 requirements — see Bugs 11 and the slice note there).
-
----
-
-## Step 3 — Start the Stack
-
-```bash
-~/start_vonr.sh
-```
-
-The script does this automatically:
-
-| Step | Action |
-|------|--------|
-| 1 | Stop conflicting systemd services + disable ufw |
-| 2 | Remove any leftover containers |
-| 3 | Start 22 core containers via `sa-vonr-deploy.yaml` (no `ibcf`, see Step 2) |
-| 4 | Wait 30s for initialization |
-| 5 | Fix pyHSS `operation_log` schema (ALTER TABLE) |
-| 6 | Start srsRAN gNB → wait 15s |
-| 7 | Start srsRAN UE → wait 20s |
-| 8 | Add routing rules on P/I/S-CSCF to reach UE subnet |
-| 9 | Add NAT/MASQUERADE on UPF for IMS traffic |
-| 10 | Install linphonec + tcpdump inside UE container |
-| 11 | Add IMS DNS entries to UE `/etc/hosts` |
-| 12 | Create linphonec configs for UE1 (port 5070) and UE2 (port 5071) |
-
-> Step 8 needs `cap_add: NET_ADMIN` on `icscf` and `scscf` in the compose file
-> to actually succeed (only `pcscf` has it by default) — see
-> [Bug 12](#bug-12--icscfscscf-route-add-fails-silently-no-net_admin). Without
-> subscribers provisioned (Step 2.5) and that capability added, this step will
-> still report "ready" but the UE/calls will not actually work — the script
-> doesn't verify its own success.
-
-**Expected output at end:**
-```
-=== VoNR stack ready ===
-PDU Session Establishment successful. IP: 192.168.101.2
-Run: ~/vonr_call.sh
-```
-
->  If you see `IP: 192.168.100.x` — the UE got the internet APN. See [Troubleshooting](#troubleshooting).
->
->  If the UE hangs forever at `Attaching UE...` with no further log output,
->  the gNB and UE ZMQ link went stale (usually after restarting only one of
->  them). Recreate **both together**:
->  ```bash
->  cd ~/docker_open5gs
->  docker compose -f srsue_5g_zmq.yaml down
->  docker compose -f srsgnb_zmq.yaml down
->  docker compose -f srsgnb_zmq.yaml up -d && sleep 15
->  docker compose -f srsue_5g_zmq.yaml up -d
->  ```
 
 ---
 
@@ -798,7 +823,7 @@ docker exec mysql mysql -u pyhss -pims_db_pass -h 172.22.0.17 -e "SELECT 1;"
 If that manual login succeeds, the account is fine — keep retrying
 `docker start pyhss`, it's still just a startup-order race.
 
-**Consequence if you skip verifying this before Step 2.5 Part B:** the IMS
+**Consequence if you skip verifying this before Step 3.5 Part B:** the IMS
 subscriber SQL insert will fail with `ERROR 1049: Unknown database
 'ims_hss_db'` (the schema doesn't exist yet because pyHSS never got far
 enough to create it), and if you also blindly ran `ALTER TABLE
