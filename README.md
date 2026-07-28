@@ -21,13 +21,30 @@
 
 ## Quick Start (TL;DR)
 
+> ⚠️ **This is not actually 5 commands.** `start_vonr.sh` does **not**
+> provision any subscribers — if you run only the commands below, `vonr_call.sh`
+> will fail instantly with `Call 1 ... error` on UE1 and nothing on UE2. You
+> must do [Step 2.5](#step-25--provision-subscribers-required-not-automated-by-any-script)
+> (both halves — 5G core **and** IMS/pyHSS, they are separate) before the
+> first `vonr_call.sh`. This block only exists to show the *shape* of a
+> normal session once you're already set up — follow the numbered Steps
+> below in order the first time, don't just run this.
+
 ```bash
-./start_vonr.sh          # start everything (~3 min)
+./start_vonr.sh          # start everything (~3 min) — does NOT provision subscribers
+#  <-- Step 2.5 (both halves) must happen here, once, before your first call
 ./vonr_call.sh           # make a VoNR call
 ./vonr_full_kpi_logs.sh  # measure call quality KPIs
-./verify_vonr_complete.sh # verify 55 checks pass
+./verify_vonr_complete.sh # verify checks pass
 ./stop_vonr.sh           # stop before shutdown
 ```
+
+> Also: **don't casually re-run `start_vonr.sh`** once you're up — it does
+> `docker rm` on every container and recreates them from scratch, which
+> discards any subscribers you provisioned and any manual fixes you've
+> applied (e.g. [Bug 14](#bug-14--pyhss-crash-loops-on-first-boot-access-denied-for-user-pyhss)).
+> If something crashed, prefer `docker start <container>` or recreating just
+> that one service, not the whole stack.
 
 ---
 
@@ -290,13 +307,59 @@ first `docker compose up -d` (takes a few extra minutes, no action needed).
 
 ## Step 2.5 — Provision Subscribers (REQUIRED, not automated by any script)
 
-Neither `start_vonr.sh` nor the WebUI login work out of the box for this. You
-must provision **both** the 5G core subscriber and the two IMS/pyHSS
-subscribers *before* starting the UE, or registration will silently fail.
-See [Subscriber Configuration](#subscriber-configuration) below for the exact,
-verified commands (the WebUI login is blocked by a CSRF check, and the SQL in
-older versions of this README used column names that don't exist in the
-current pyHSS schema — use the corrected SQL there, not `id`).
+Neither `start_vonr.sh` nor the WebUI login work out of the box for this.
+**This step has two independent halves — you need both, or the call fails.**
+It's easy to do only Part A and stop, because it "succeeds" with no error —
+you just get an instant `Call 1 ... error` later with no obvious link back
+to this step. Do both, in order, right now:
+
+**☐ Part A — 5G core subscriber (via `open5gs-dbctl`, not the WebUI — its login is CSRF-blocked for scripts):**
+```bash
+docker exec webui /open5gs/misc/db/open5gs-dbctl --db_uri=mongodb://mongo/open5gs add 001011234567895 8baf473f2f8fd09487cccbd7097c6862 8E27B6AF0E692E750F32667A3B14605D
+docker exec webui /open5gs/misc/db/open5gs-dbctl --db_uri=mongodb://mongo/open5gs update_apn 001011234567895 ims 1
+docker exec mongo mongosh --quiet open5gs --eval 'db.subscribers.updateOne({imsi: "001011234567895", "slice.session.name": "ims"}, {$set: {"slice.$.sst": 1}})'
+```
+
+**☐ Part B — IMS/pyHSS subscribers (via MySQL).** First confirm pyHSS
+actually created its database — if it hit
+[Bug 14](#bug-14--pyhss-crash-loops-on-first-boot-access-denied-for-user-pyhss)
+(a first-boot crash), `ims_hss_db` won't exist yet and Part B will fail with
+`Unknown database 'ims_hss_db'`:
+```bash
+docker ps --format "table {{.Names}}\t{{.Status}}" | grep pyhss   # must say "Up", not "Exited"
+```
+If it says `Exited`, run `docker start pyhss`, wait ~15s, and check again
+before continuing. Once it's `Up`, run Part B as **one single-line command**
+(do not convert this to a `<<EOF` heredoc, see the warning at the top of
+this README):
+```bash
+docker exec -i mysql mysql -u root -pchangeme ims_hss_db -e "
+INSERT INTO apn (apn_id, apn, apn_ambr_dl, apn_ambr_ul) VALUES (1, 'internet', 1000000000, 1000000000);
+INSERT INTO apn (apn_id, apn, apn_ambr_dl, apn_ambr_ul) VALUES (3, 'ims', 1000000000, 1000000000);
+INSERT INTO auc (auc_id, imsi, ki, opc, amf, sqn) VALUES (1, '9076543210', '8baf473f2f8fd09487cccbd7097c6862', '8E27B6AF0E692E750F32667A3B14605D', '8000', 0);
+INSERT INTO subscriber (subscriber_id, imsi, msisdn, enabled, auc_id, default_apn, apn_list) VALUES (1, '9076543210', '9076543210', 1, 1, 1, '1,3');
+INSERT INTO ims_subscriber (ims_subscriber_id, imsi, msisdn, scscf, ifc_path, sh_template_path) VALUES (1, '9076543210', '9076543210', 'sip:scscf.ims.mnc001.mcc001.3gppnetwork.org:6060', 'default_ifc.xml', 'default_sh_user_data.xml');
+INSERT INTO auc (auc_id, imsi, ki, opc, amf, sqn) VALUES (2, '9076543211', '8baf473f2f8fd09487cccbd7097c6862', '8E27B6AF0E692E750F32667A3B14605D', '8000', 0);
+INSERT INTO subscriber (subscriber_id, imsi, msisdn, enabled, auc_id, default_apn, apn_list) VALUES (2, '9076543211', '9076543211', 1, 2, 1, '1,3');
+INSERT INTO ims_subscriber (ims_subscriber_id, imsi, msisdn, scscf, ifc_path, sh_template_path) VALUES (2, '9076543211', '9076543211', 'sip:scscf.ims.mnc001.mcc001.3gppnetwork.org:6060', 'default_ifc.xml', 'default_sh_user_data.xml');
+"
+docker restart pyhss
+sleep 15
+docker exec mysql mysql -u root -pchangeme ims_hss_db -e "ALTER TABLE operation_log MODIFY item_id INTEGER NULL;"
+```
+
+**Verify both parts landed before moving on:**
+```bash
+docker exec webui /open5gs/misc/db/open5gs-dbctl --db_uri=mongodb://mongo/open5gs showfiltered   # Part A — expect 1 row
+docker exec mysql mysql -u root -pchangeme ims_hss_db -e "SELECT COUNT(*) FROM subscriber;"       # Part B — expect 2
+```
+If either shows 0 rows, that half didn't run — go back and redo it before
+touching `~/vonr_call.sh`.
+
+Full field-by-field explanation of every value used above is in
+[Subscriber Configuration](#subscriber-configuration) below, including why
+`ifc_path` and the `sst` field matter (they're both undocumented-elsewhere
+requirements — see Bugs 11 and the slice note there).
 
 ---
 
