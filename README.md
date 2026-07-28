@@ -446,7 +446,28 @@ docker compose -f srsue_5g_zmq.yaml up -d
 sleep 20
 docker logs srsue_5g_zmq 2>&1 | grep "PDU Session"   # expect: PDU Session Establishment successful. IP: 192.168.101.2
 ```
-If that line doesn't appear, see the note under Step 3 above, and
+
+> ⚠️ **This recreate wipes `linphone-cli`, `tcpdump`, and the linphonerc
+> configs off the UE container.** `start_vonr.sh` installed those on the
+> *original* `srsue_5g_zmq` container instance, but the container has no
+> persistent volume for `/root` or its installed packages — recreating it
+> (which you just did, on purpose, to fix the attach) throws all of that
+> away along with it. If you skip this, `~/vonr_call.sh` produces **no
+> output at all** for UE1/UE2 (not even the usual video-policy warning),
+> which is a different, more confusing symptom than a normal registration
+> failure. Redo this setup now, before calling `~/vonr_call.sh`:
+> ```bash
+> docker exec srsue_5g_zmq apt-get install -y linphone-cli tcpdump
+> docker exec srsue_5g_zmq mkdir -p /root/ue1/.local/share/linphone /root/ue2/.local/share/linphone
+> docker exec srsue_5g_zmq bash -c "getent hosts scscf.ims.mnc001.mcc001.3gppnetwork.org || printf '172.22.0.21 ims.mnc001.mcc001.3gppnetwork.org\n172.22.0.20 scscf.ims.mnc001.mcc001.3gppnetwork.org\n172.22.0.19 icscf.ims.mnc001.mcc001.3gppnetwork.org\n' >> /etc/hosts"
+> docker exec srsue_5g_zmq bash -c "printf '[sip]\nsip_port=5070\nsip_tcp_port=5070\ndefault_proxy=0\nverify_server_certs=0\nverify_server_cn=0\n[proxy_0]\nreg_proxy=sip:172.22.0.21\nreg_identity=sip:9076543210@ims.mnc001.mcc001.3gppnetwork.org\nreg_expires=300\nreg_sendregister=1\npublish=0\n[auth_info_0]\nusername=9076543210\nuserid=9076543210\npasswd=8baf473f2f8fd09487cccbd7097c6862\nrealm=ims.mnc001.mcc001.3gppnetwork.org\n' > /root/ue1/linphonerc"
+> docker exec srsue_5g_zmq bash -c "printf '[sip]\nsip_port=5071\nsip_tcp_port=5071\ndefault_proxy=0\nverify_server_certs=0\nverify_server_cn=0\n[proxy_0]\nreg_proxy=sip:172.22.0.21\nreg_identity=sip:9076543211@ims.mnc001.mcc001.3gppnetwork.org\nreg_expires=300\nreg_sendregister=1\npublish=0\n[auth_info_0]\nusername=9076543211\nuserid=9076543211\npasswd=8baf473f2f8fd09487cccbd7097c6862\nrealm=ims.mnc001.mcc001.3gppnetwork.org\n' > /root/ue2/linphonerc"
+> ```
+> **This same wipe happens every time you recreate `srsue_5g_zmq` for any
+> reason** (e.g. following Bug 13 elsewhere in this README) — not just here.
+> Redo this setup any time you do that.
+
+If that "PDU Session" line doesn't appear, see the note under Step 3 above, and
 [Troubleshooting](#troubleshooting).
 
 Full field-by-field explanation of every value used above is in
@@ -775,6 +796,14 @@ sleep 15
 docker compose -f srsue_5g_zmq.yaml up -d
 ```
 
+> ⚠️ **This also wipes `linphone-cli`, `tcpdump`, and the linphonerc configs
+> off the UE container** — `srsue_5g_zmq` has no persistent volume for
+> `/root` or its installed packages, so recreating it throws those away too.
+> If a call worked before and stops working with **no output at all** from
+> `~/vonr_call.sh` (not even the usual video-policy warning) right after you
+> did this, that's why — redo the linphone setup, given in full under
+> [Step 3.5 Part C](#step-35--provision-subscribers-required-not-automated-by-any-script).
+
 ---
 
 ### Bug 14 — pyHSS Crash-Loops on First Boot: `Access denied for user 'pyhss'`
@@ -852,6 +881,7 @@ problems to debug individually.
 | REGISTER loops on 401 forever, never 200 OK | pyHSS `ifc_path` NULL, SAA never sent | `UPDATE ims_subscriber SET ifc_path=..., sh_template_path=...` — see [Bug 11](#bug-11--pyhss-crashes-generating-saa-when-ifc_path-is-null) |
 | PDU session rejected: "DNN not supported in slice" | `ims` APN slice missing `sst` | Set `slice.$.sst` to match the default slice (usually `1`) — see [Subscriber Configuration](#subscriber-configuration) |
 | UE stuck at `Attaching UE...` forever, no logs | gNB/UE ZMQ link went stale from a lone restart | Recreate gNB + UE together — see [Bug 13](#bug-13--ue-hangs-forever-at-attaching-ue-after-a-lone-restart) |
+| `vonr_call.sh` produces **no output at all** for UE1/UE2 after recreating the UE | Recreating `srsue_5g_zmq` wipes `linphone-cli`/configs (no persistent volume) | Reinstall + recreate linphonerc configs — see [Step 3.5 Part C](#step-35--provision-subscribers-required-not-automated-by-any-script) |
 | `verify_vonr_complete.sh`: I-CSCF/S-CSCF no route | Only P-CSCF has `NET_ADMIN` by default | Harmless for calls; add `NET_ADMIN` to fix the check — see [Bug 12](#bug-12--i-cscfs-cscf-route-add-fails-silently-no-net_admin) |
 | WebUI login returns `403 CSRF token missing` | `curl`/API login without a CSRF token | Provision subscribers via `open5gs-dbctl` instead (see [Subscriber Configuration](#subscriber-configuration)), or use a real browser for the WebUI |
 | `pyhss` exits shortly after start, `Access denied for user 'pyhss'` | MySQL user-creation race on first boot | `docker start pyhss` — see [Bug 14](#bug-14--pyhss-crash-loops-on-first-boot-access-denied-for-user-pyhss) |
