@@ -321,17 +321,33 @@ docker exec mongo mongosh --quiet open5gs --eval 'db.subscribers.updateOne({imsi
 ```
 
 **☐ Part B — IMS/pyHSS subscribers (via MySQL).** First confirm pyHSS
-actually created its database — if it hit
-[Bug 14](#bug-14--pyhss-crash-loops-on-first-boot-access-denied-for-user-pyhss)
-(a first-boot crash), `ims_hss_db` won't exist yet and Part B will fail with
-`Unknown database 'ims_hss_db'`:
+actually created its database. **pyHSS crashing on first boot is common on
+this stack, not a rare edge case** — its own init script has a race between
+creating its MySQL user and the Python service trying to use it (see
+[Bug 14](#bug-14--pyhss-crash-loops-on-first-boot-access-denied-for-user-pyhss)),
+and it can take more than one restart to win the race. **Do not eyeball
+`docker ps | grep pyhss`** — an `Exited` container produces silent, easy-to-miss
+*empty output* from that grep (no red text, nothing that looks like an
+error), which is exactly how this gets missed. Use this instead, which
+prints an explicit PASS/FAIL and won't let you continue silently on a dead
+container:
 ```bash
-docker ps --format "table {{.Names}}\t{{.Status}}" | grep pyhss   # must say "Up", not "Exited"
+for i in 1 2 3 4 5; do
+  STATUS=$(docker inspect -f '{{.State.Status}}' pyhss 2>/dev/null)
+  if [ "$STATUS" = "running" ]; then
+    echo "PASS: pyhss is running"
+    break
+  fi
+  echo "pyhss is '$STATUS', not running (attempt $i/5) — restarting and waiting 15s..."
+  docker start pyhss >/dev/null
+  sleep 15
+done
+docker exec mysql mysql -u root -pchangeme -e "SHOW DATABASES;" | grep -q ims_hss_db \
+  && echo "PASS: ims_hss_db exists" || echo "FAIL: ims_hss_db still missing — do not proceed to Part B's SQL yet"
 ```
-If it says `Exited`, run `docker start pyhss`, wait ~15s, and check again
-before continuing. Once it's `Up`, run Part B as **one single-line command**
-(do not convert this to a `<<EOF` heredoc, see the warning at the top of
-this README):
+Only proceed once you see **both** `PASS` lines. Once confirmed, run Part B
+as **one single-line command** (do not convert this to a `<<EOF` heredoc,
+see the warning at the top of this README):
 ```bash
 docker exec -i mysql mysql -u root -pchangeme ims_hss_db -e "
 INSERT INTO apn (apn_id, apn, apn_ambr_dl, apn_ambr_ul) VALUES (1, 'internet', 1000000000, 1000000000);
@@ -753,23 +769,42 @@ first boot where MySQL itself is still initializing its data directory.
 pyHSS's own retry logic doesn't survive this and the process exits instead
 of retrying.
 
-**Fix:** This is a one-time race on first boot. Once MySQL has fully settled
-(it has, if `pyhss` crashed rather than the whole stack hanging), just
-restart it — the user account it needed is already there, only the timing
-was off:
+**This is common, not a rare edge case** — it was reproduced on multiple
+independent runs of this stack, including with a single `docker start`
+sometimes not being enough (it can take 2-3 tries if MySQL itself is also
+still settling). Budget for it every time you bring the stack up fresh;
+don't assume a single restart always fixes it on the first try.
+
+**Fix:** Restart it, and actually verify it's running (not just assume) —
+`docker ps | grep pyhss` produces silent, easy-to-miss *empty output* when
+it's `Exited`, so don't eyeball it. Use a loop that confirms and retries:
 ```bash
-docker start pyhss
+for i in 1 2 3 4 5; do
+  STATUS=$(docker inspect -f '{{.State.Status}}' pyhss 2>/dev/null)
+  [ "$STATUS" = "running" ] && { echo "PASS: pyhss is running"; break; }
+  echo "pyhss is '$STATUS' (attempt $i/5) — restarting, waiting 15s..."
+  docker start pyhss >/dev/null
+  sleep 15
+done
 ```
-If it crashes again immediately, first confirm the account actually exists
-and its password is correct (do **not** assume it's a real credentials
-problem without checking — in every case observed here the account and
-password were correct, the timing was just off):
+If it's still not `running` after 5 attempts (rare), then — and only then —
+check whether it's a genuine credentials problem rather than a timing race
+(in every case observed while building this stack, it was timing, not a bad
+credential, but verify rather than assume):
 ```bash
 docker exec mysql mysql -u root -pchangeme -e "SELECT user,host FROM mysql.user WHERE user='pyhss';"
 docker exec mysql mysql -u pyhss -pims_db_pass -h 172.22.0.17 -e "SELECT 1;"
 ```
-If that manual login succeeds, `docker start pyhss` again — it was purely a
-startup-order race, not a bad credential.
+If that manual login succeeds, the account is fine — keep retrying
+`docker start pyhss`, it's still just a startup-order race.
+
+**Consequence if you skip verifying this before Step 2.5 Part B:** the IMS
+subscriber SQL insert will fail with `ERROR 1049: Unknown database
+'ims_hss_db'` (the schema doesn't exist yet because pyHSS never got far
+enough to create it), and if you also blindly ran `ALTER TABLE
+operation_log ...` afterward it fails too with `ERROR 1146: Table doesn't
+exist` — both are downstream symptoms of this same root cause, not separate
+problems to debug individually.
 
 ---
 
