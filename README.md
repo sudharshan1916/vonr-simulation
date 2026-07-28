@@ -196,9 +196,12 @@ sed -i 's/apn = internet/apn = ims/' srslte/ue_5g_zmq.conf
 # CRITICAL FIX — set DOCKER_HOST_IP / *_ADVERTISE_IP in .env to THIS machine's
 # real LAN IP (`ip -4 addr show`), not the placeholder in the file.
 
-# Clone this repo's scripts into home directory
-git clone https://github.com/sudharshan1916/VoNR_Private.git /tmp/vonr
-cp /tmp/vonr/scripts/*.sh ~/
+# Clone THIS repo (vonr-simulation) if you haven't already — its scripts/
+# folder is what you actually need. (An earlier version of this README
+# pointed at a separate "VoNR_Private" repo; that repo does not have a
+# scripts/ folder and should not be used — ignore any reference to it.)
+git clone https://github.com/sudharshan1916/vonr-simulation.git ~/vonr-simulation
+cp ~/vonr-simulation/scripts/*.sh ~/
 chmod +x ~/start_vonr.sh ~/vonr_call.sh ~/stop_vonr.sh
 chmod +x ~/verify_vonr_complete.sh ~/vonr_full_kpi_logs.sh
 ```
