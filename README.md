@@ -4,6 +4,19 @@
 
 > **What this is:** A complete, working VoNR (Voice over 5G New Radio) simulation on a single Ubuntu machine. Two software phones make a real voice call over a fully simulated 5G Standalone network with IMS — no hardware, no SIM cards, no spectrum license.
 
+> **Before you start — read this if you're pasting commands from a chat app,
+> web terminal, or anything other than a plain local terminal:** several
+> steps below use multi-line `<<EOF ... EOF` heredocs. Many paste tools
+> (including some SSH web consoles and chat UIs) auto-indent continuation
+> lines when you paste a multi-line block. A heredoc terminator (`EOF`,
+> `SQL`, etc.) **must have zero leading whitespace** or bash will not
+> recognize it, and the command will hang waiting for input (you'll see a
+> `>` prompt that never goes away). If that happens, press `Ctrl-D` (or type
+> the terminator with no leading spaces and press enter) to escape it, then
+> re-paste. Wherever this repo hit that problem in practice, the command
+> below has already been rewritten as a single-line `printf`/`-e` form that
+> doesn't have this risk — prefer those when given a choice.
+
 ---
 
 ## Quick Start (TL;DR)
@@ -120,7 +133,7 @@ VoNR stack is fully operational!
 │  │  MySQL   │   │ 172.22.0.16 │                                     │
 │  └──────────┘   └─────────────┘                                     │
 │                                                                     │
-│  Docker Network: 172.22.0.0/24    26 containers total               │
+│  Docker Network: 172.22.0.0/24    22 containers total (no ibcf)      │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -155,19 +168,47 @@ VoNR stack is fully operational!
 
 ## Step 1 — Install Dependencies
 
+**Check first whether Docker is already installed** — many machines already
+have Docker CE (from Docker's own apt repo) rather than Ubuntu's `docker.io`
+package. If both commands below print a version, **skip the Docker install
+block entirely** — installing `docker.io`/`docker-compose-plugin` on top of
+an existing Docker CE install fails with `E: Unable to locate package
+docker-compose-plugin` (the package name only exists in Docker's own repo,
+not Ubuntu's), and isn't needed anyway.
+
 ```bash
-# Docker
+docker --version
+docker compose version
+```
+
+If either command fails, install Docker:
+
+```bash
 sudo apt update && sudo apt upgrade -y
 sudo apt install -y docker.io docker-compose-plugin
 sudo usermod -aG docker $USER
 newgrp docker
+docker compose version   # must be v2.x
+```
 
-# Verify Docker Compose V2 (must be v2.x)
-docker compose version
+Then install the network tools (needed regardless of whether Docker was already present):
 
-# Network tools
+```bash
 sudo apt install -y tshark tcpdump net-tools linphone-cli
+```
 
+> **If this hangs at "Setting up wireshark-common..." with no further
+> output:** `tshark`'s install triggers an interactive debconf prompt
+> ("Should non-superusers be able to capture packets?") that needs a
+> terminal to answer. If your session doesn't provide one, the install can
+> hang indefinitely. Either answer the prompt directly if you see it, or
+> pre-seed the answer non-interactively before installing:
+> ```bash
+> echo "wireshark-common wireshark-common/install-setuid boolean true" | sudo debconf-set-selections
+> sudo DEBIAN_FRONTEND=noninteractive apt install -y tshark tcpdump net-tools linphone-cli
+> ```
+
+```bash
 # Allow tcpdump without password (needed for RTP capture scripts)
 echo "$USER ALL=(ALL) NOPASSWD: /usr/bin/tcpdump" | sudo tee /etc/sudoers.d/tcpdump
 sudo chmod 440 /etc/sudoers.d/tcpdump
@@ -181,7 +222,15 @@ echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf
 
 ## Step 2 — Clone and Configure
 
+> **Clone into your home directory (`~`), not `~/Desktop` or anywhere else.**
+> Every script in this repo hardcodes the path `~/docker_open5gs`. If you
+> clone it somewhere else, `start_vonr.sh`/`stop_vonr.sh` will fail with
+> `cd: /home/you/docker_open5gs: No such file or directory`. If you've
+> already cloned it elsewhere and don't want to move it, symlink instead:
+> `ln -s ~/Desktop/docker_open5gs ~/docker_open5gs`.
+
 ```bash
+cd ~
 # Clone the base stack
 git clone https://github.com/herlesupreeth/docker_open5gs.git
 cd docker_open5gs
@@ -211,9 +260,10 @@ chmod +x ~/verify_vonr_complete.sh ~/vonr_full_kpi_logs.sh
 > returns `403 Forbidden` from etsi.org — the build fails and nothing comes up.
 > `ibcf` (voicemail/interconnect border function) is not part of the VoNR call
 > path in the [Architecture](#architecture) diagram above, so skip it — after
-> copying the scripts below, patch the compose file reference:
+> copying the scripts below, patch **both** scripts that reference it
+> (`stop_vonr.sh` references it too, not just `start_vonr.sh`):
 > ```bash
-> sed -i 's/sa-vonr-ibcf-deploy.yaml/sa-vonr-deploy.yaml/' ~/start_vonr.sh
+> sed -i 's/sa-vonr-ibcf-deploy.yaml/sa-vonr-deploy.yaml/' ~/start_vonr.sh ~/stop_vonr.sh
 > ```
 > If you *do* want `ibcf`, add `NET_ADMIN`/routing yourself and be ready to
 > patch its Dockerfile to skip the EVS codec `wget` step.
@@ -369,7 +419,11 @@ Mean Delta: 19.988ms    Codec: opus
 ~/verify_vonr_complete.sh
 ```
 
-Runs automated checks across all layers. **Expected: 55/55 PASS**.
+Runs automated checks across all layers. **Expected: 54/55 or 55/55 PASS**
+— 54/55 is normal and not a real problem if the only failure is
+`S-CSCF — no active SIP registrations`, which is a check-ordering artifact
+in the script itself, not a functional defect (see the Troubleshooting table
+below). Anything else failing is worth investigating.
 
 | Section | Checks |
 |---------|--------|
@@ -580,18 +634,24 @@ Both files ship inside the `pyhss` container at `/pyhss/default_ifc.xml` and `/p
 
 **Symptom:** `start_vonr.sh`'s Step 8 (`docker exec icscf ip route add ...`, `docker exec scscf ip route add ...`) fails with `Operation not permitted`, silenced by the script's `2>/dev/null`. `verify_vonr_complete.sh` reports `[FAIL] I-CSCF — no route to UE subnet` / `S-CSCF — no route to UE subnet`.
 
-**Root cause:** Only `pcscf` has `cap_add: NET_ADMIN` / `privileged: true` in `docker_open5gs`'s compose files by default. In practice **P-CSCF is the only element that needs the direct route** (it is the sole UE-facing proxy — I-CSCF/S-CSCF only talk to pyHSS via Diameter and to P-CSCF), so this doesn't block calls. To get a clean 55/55 on the verification script anyway, add the capability and recreate:
+**Root cause:** Only `pcscf` has `cap_add: NET_ADMIN` / `privileged: true` in `docker_open5gs`'s compose files by default. In practice **P-CSCF is the only element that needs the direct route** (it is the sole UE-facing proxy — I-CSCF/S-CSCF only talk to pyHSS via Diameter and to P-CSCF), so this doesn't block calls. This is entirely optional — only do it if you want a clean 55/55 on the verification script.
+
+**Fix (optional):** Edit the compose file, then **recreate** (not just restart) `icscf`/`scscf` — editing the YAML alone changes nothing until the containers are recreated with `up -d`:
 
 ```bash
-# In sa-vonr-deploy.yaml, under both `icscf:` and `scscf:` service blocks, add:
-#   cap_add:
-#     - NET_ADMIN
-
 cd ~/docker_open5gs
-docker compose -f sa-vonr-deploy.yaml up -d icscf scscf   # recreates with the new capability
+sed -i '/COMPONENT_NAME=icscf/a\    cap_add:\n      - NET_ADMIN' sa-vonr-deploy.yaml
+sed -i '/COMPONENT_NAME=scscf/a\    cap_add:\n      - NET_ADMIN' sa-vonr-deploy.yaml
+
+docker compose -f sa-vonr-deploy.yaml up -d icscf scscf   # actually recreates the containers
+sleep 8
 docker exec icscf ip route add 192.168.101.0/24 via 172.22.0.8
 docker exec scscf ip route add 192.168.101.0/24 via 172.22.0.8
 ```
+
+> Recreating `icscf`/`scscf` resets their in-memory Diameter/registration
+> state — give them ~10s to reconnect to pyHSS (`docker logs icscf` should
+> show `Peer hss.ims...:3875 [] connected`) before placing another call.
 
 ---
 
@@ -610,6 +670,43 @@ docker compose -f srsgnb_zmq.yaml up -d
 sleep 15
 docker compose -f srsue_5g_zmq.yaml up -d
 ```
+
+---
+
+### Bug 14 — pyHSS Crash-Loops on First Boot: `Access denied for user 'pyhss'`
+
+**Symptom:** Shortly after `~/start_vonr.sh` finishes, `docker ps -a` shows
+`pyhss` as `Exited (1)` — it's missing from `docker ps` entirely. Its logs
+end with:
+```
+sqlalchemy.exc.OperationalError: (MySQLdb.OperationalError) (1045, "Access denied for user 'pyhss'@'pyhss.docker_open5gs_default' (using password: YES)")
+```
+
+**Root cause:** `pyhss`'s own init script (`pyhss/pyhss_init.sh`) waits for
+MySQL to accept connections, then creates the `pyhss` MySQL user and grants
+it privileges — but the Python service inside the same container can start
+before that `CREATE USER`/`GRANT` sequence finishes, especially on a slower
+first boot where MySQL itself is still initializing its data directory.
+pyHSS's own retry logic doesn't survive this and the process exits instead
+of retrying.
+
+**Fix:** This is a one-time race on first boot. Once MySQL has fully settled
+(it has, if `pyhss` crashed rather than the whole stack hanging), just
+restart it — the user account it needed is already there, only the timing
+was off:
+```bash
+docker start pyhss
+```
+If it crashes again immediately, first confirm the account actually exists
+and its password is correct (do **not** assume it's a real credentials
+problem without checking — in every case observed here the account and
+password were correct, the timing was just off):
+```bash
+docker exec mysql mysql -u root -pchangeme -e "SELECT user,host FROM mysql.user WHERE user='pyhss';"
+docker exec mysql mysql -u pyhss -pims_db_pass -h 172.22.0.17 -e "SELECT 1;"
+```
+If that manual login succeeds, `docker start pyhss` again — it was purely a
+startup-order race, not a bad credential.
 
 ---
 
@@ -634,6 +731,10 @@ docker compose -f srsue_5g_zmq.yaml up -d
 | UE stuck at `Attaching UE...` forever, no logs | gNB/UE ZMQ link went stale from a lone restart | Recreate gNB + UE together — see [Bug 13](#bug-13--ue-hangs-forever-at-attaching-ue-after-a-lone-restart) |
 | `verify_vonr_complete.sh`: I-CSCF/S-CSCF no route | Only P-CSCF has `NET_ADMIN` by default | Harmless for calls; add `NET_ADMIN` to fix the check — see [Bug 12](#bug-12--i-cscfs-cscf-route-add-fails-silently-no-net_admin) |
 | WebUI login returns `403 CSRF token missing` | `curl`/API login without a CSRF token | Provision subscribers via `open5gs-dbctl` instead (see [Subscriber Configuration](#subscriber-configuration)), or use a real browser for the WebUI |
+| `pyhss` exits shortly after start, `Access denied for user 'pyhss'` | MySQL user-creation race on first boot | `docker start pyhss` — see [Bug 14](#bug-14--pyhss-crash-loops-on-first-boot-access-denied-for-user-pyhss) |
+| `E: Unable to locate package docker-compose-plugin` | Docker CE already installed from a different apt repo | Check `docker --version && docker compose version` first — skip the whole Docker install block if both work |
+| Pasted a multi-line command, terminal now shows `>` forever | Heredoc terminator got indented by your paste tool, bash is still waiting for it | `Ctrl-D` to escape, then use the single-line `printf`/`-e` form given nearby instead of the heredoc |
+| `verify_vonr_complete.sh`: `[FAIL] S-CSCF — no active SIP registrations`, but Section 9's live call passed anyway | Section 8 checks registration state *before* Section 9 places its own test call — a check-ordering bug in the script itself, most visible right after recreating `icscf`/`scscf` | Not a real failure (Section 9 already proved it works). Run the script a second time back-to-back and it will find the registration left by the first run's Section 9 |
 
 ---
 
@@ -641,7 +742,7 @@ docker compose -f srsue_5g_zmq.yaml up -d
 
 | Script | Purpose | When to Use |
 |--------|---------|-------------|
-| `start_vonr.sh` | Start full stack (26 containers + all config) | After every reboot |
+| `start_vonr.sh` | Start full stack (22 containers + all config) | After every reboot |
 | `vonr_call.sh` | Make a VoNR call between UE1 and UE2 | Quick call test |
 | `vonr_full_kpi_logs.sh` | Full KPI measurement — SIP flow, setup time, RTP metrics | For measurements |
 | `verify_vonr_complete.sh` | 55-point automated verification | Confirm everything works |
@@ -719,40 +820,34 @@ docker exec webui /open5gs/misc/db/open5gs-dbctl --db_uri=mongodb://mongo/open5g
 > are **not optional** — see [Bug 11](#bug-11--pyhss-crashes-generating-saa-when-ifc_path-is-null).
 > Without them, REGISTER loops on 401 forever and never reaches 200 OK.
 
-```sql
--- Connect: docker exec -it mysql mysql -u root -pchangeme ims_hss_db
--- (use `docker exec -i` — not just `-it` — if piping this via a heredoc/script,
---  or the SQL never reaches the container's stdin and nothing happens)
+Run this as **one single-line command** (all statements in one `-e "..."`
+argument) — do **not** convert this to a `<<EOF` heredoc; every leading
+space inside a quoted `-e` argument is harmless, but a heredoc terminator
+is not (see the warning at the top of this README):
 
--- APN entries (apn_ambr_dl/apn_ambr_ul are NOT NULL in this schema)
+```bash
+docker exec -i mysql mysql -u root -pchangeme ims_hss_db -e "
 INSERT INTO apn (apn_id, apn, apn_ambr_dl, apn_ambr_ul) VALUES (1, 'internet', 1000000000, 1000000000);
 INSERT INTO apn (apn_id, apn, apn_ambr_dl, apn_ambr_ul) VALUES (3, 'ims', 1000000000, 1000000000);
+INSERT INTO auc (auc_id, imsi, ki, opc, amf, sqn) VALUES (1, '9076543210', '8baf473f2f8fd09487cccbd7097c6862', '8E27B6AF0E692E750F32667A3B14605D', '8000', 0);
+INSERT INTO subscriber (subscriber_id, imsi, msisdn, enabled, auc_id, default_apn, apn_list) VALUES (1, '9076543210', '9076543210', 1, 1, 1, '1,3');
+INSERT INTO ims_subscriber (ims_subscriber_id, imsi, msisdn, scscf, ifc_path, sh_template_path) VALUES (1, '9076543210', '9076543210', 'sip:scscf.ims.mnc001.mcc001.3gppnetwork.org:6060', 'default_ifc.xml', 'default_sh_user_data.xml');
+INSERT INTO auc (auc_id, imsi, ki, opc, amf, sqn) VALUES (2, '9076543211', '8baf473f2f8fd09487cccbd7097c6862', '8E27B6AF0E692E750F32667A3B14605D', '8000', 0);
+INSERT INTO subscriber (subscriber_id, imsi, msisdn, enabled, auc_id, default_apn, apn_list) VALUES (2, '9076543211', '9076543211', 1, 2, 1, '1,3');
+INSERT INTO ims_subscriber (ims_subscriber_id, imsi, msisdn, scscf, ifc_path, sh_template_path) VALUES (2, '9076543211', '9076543211', 'sip:scscf.ims.mnc001.mcc001.3gppnetwork.org:6060', 'default_ifc.xml', 'default_sh_user_data.xml');
+"
+```
 
--- Authentication credentials (imsi = MSISDN intentionally, see Bug 1)
-INSERT INTO auc (auc_id, imsi, ki, opc, amf, sqn)
-VALUES (1, '9076543210', '8baf473f2f8fd09487cccbd7097c6862',
-        '8E27B6AF0E692E750F32667A3B14605D', '8000', 0);
+(`docker exec -i`, not just `-it` — needed for the multi-line `-e` argument
+to reach the container correctly.) What each line does, if you want to
+adapt it: two APN entries (`apn_ambr_dl/ul` are `NOT NULL` in this schema),
+two `auc` rows (credentials — `imsi` is intentionally set to the MSISDN
+value, see Bug 1), two `subscriber` rows, and two `ims_subscriber` rows
+(S-CSCF address + IFC/Sh templates, see Bug 11).
 
--- Subscriber (imsi = MSISDN intentionally, apn_list = '1,3')
-INSERT INTO subscriber (subscriber_id, imsi, msisdn, enabled, auc_id, default_apn, apn_list)
-VALUES (1, '9076543210', '9076543210', 1, 1, 1, '1,3');
-
--- IMS subscriber with S-CSCF address + IFC/Sh templates (see Bug 11)
-INSERT INTO ims_subscriber (ims_subscriber_id, imsi, msisdn, scscf, ifc_path, sh_template_path)
-VALUES (1, '9076543210', '9076543210',
-        'sip:scscf.ims.mnc001.mcc001.3gppnetwork.org:6060',
-        'default_ifc.xml', 'default_sh_user_data.xml');
-
--- Second subscriber (UE2)
-INSERT INTO auc (auc_id, imsi, ki, opc, amf, sqn)
-VALUES (2, '9076543211', '8baf473f2f8fd09487cccbd7097c6862',
-        '8E27B6AF0E692E750F32667A3B14605D', '8000', 0);
-INSERT INTO subscriber (subscriber_id, imsi, msisdn, enabled, auc_id, default_apn, apn_list)
-VALUES (2, '9076543211', '9076543211', 1, 2, 1, '1,3');
-INSERT INTO ims_subscriber (ims_subscriber_id, imsi, msisdn, scscf, ifc_path, sh_template_path)
-VALUES (2, '9076543211', '9076543211',
-        'sip:scscf.ims.mnc001.mcc001.3gppnetwork.org:6060',
-        'default_ifc.xml', 'default_sh_user_data.xml');
+Verify it landed:
+```bash
+docker exec mysql mysql -u root -pchangeme ims_hss_db -e "SELECT subscriber_id,imsi,msisdn FROM subscriber; SELECT ims_subscriber_id,imsi,ifc_path FROM ims_subscriber;"
 ```
 
 `default_ifc.xml` and `default_sh_user_data.xml` ship inside the `pyhss`
